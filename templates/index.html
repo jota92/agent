@@ -1,0 +1,18 @@
+<!doctype html>
+<html lang="ja">
+  <head>
+    <meta charset="utf-8">
+    <title>Chromium リモートブラウザ</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='styles.css') }}">
+    <script src="{{ url_for('static', filename='socket.io.min.js') }}"></script>
+  </head>
+  <body>
+    <header id="status-bar">
+      <span id="status-text">接続準備中...</span>
+    </header>
+    <main class="viewport">
+      <canvas id="browser-canvas"></canvas>
+    </main>
+    <script src="{{ url_for('static', filename='client.js') }}"></script>
+  </body>
+</html>

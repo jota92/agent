@@ -1,0 +1,4 @@
+Flask>=2.3,<3.0
+selenium>=4.21
+pillow>=10.2
+requests>=2.31.0
