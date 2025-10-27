@@ -2,92 +2,65 @@
 
 ## 🎯 概要
 
-ローカル AI (Ollama) を使用してウェブサイトを自動操作する AI エージェントシステムです。
+ローカルの Transformer ベース視覚言語モデルを使用してウェブサイトを自動操作する AI エージェントシステムです。\
+Google 検索などの一般的なブラウジングタスクは自動的にサブステップへ分解され、UI 左側に「Agent Plan」として可視化されます。
 
 ## 📋 必要な環境
 
-- macOS (Apple Silicon または Intel)
-- Python 3.8 以上
-- Google Chrome
-- Homebrew
+- Linux または macOS
+- Python 3.8 以上（3.10 推奨）
+- Google Chrome / Chromium
+- ChromeDriver（ブラウザとバージョンを揃える）
+- 16GB 以上のメモリ推奨（モデル展開で ~8GB 使用）
+- 初回のみモデルダウンロード用のインターネット接続（約 4GB）
 
 ## 🚀 セットアップ手順
 
-### 1. Ollama のインストール
+### 1. リポジトリの取得
 
 ```bash
-# Homebrew で Ollama をインストール
-brew install ollama
-
-# Ollama サービスを起動
-ollama serve
+git clone https://github.com/YOUR_USERNAME/agent.git
+cd agent
 ```
 
-別のターミナルウィンドウで:
+### 2. クイックスタートスクリプトを実行
 
 ```bash
-# ビジョン対応の LLaVA モデルをダウンロード (推奨: 13B版)
-ollama pull llava:13b
-
-# または軽量版 (7B) - メモリが少ない場合
-# ollama pull llava:7b
-
-# または小型版 (Moondream) - 更に軽量
-# ollama pull moondream
+chmod +x start.sh
+./start.sh
 ```
 
-### 2. Python 環境のセットアップ
+スクリプトは以下の処理を自動化します:
 
-```bash
-cd /Users/jota/Downloads/agent
+- Python 仮想環境の作成と有効化
+- 必要な Python パッケージのインストール
+- Qwen2-VL-2B Instruct モデルのダウンロード（初回のみ約 4GB）
+- サーバーの起動
 
-# 仮想環境を作成
-python3 -m venv venv
-
-# 仮想環境を有効化
-source venv/bin/activate
-
-# 依存パッケージをインストール
-pip install --upgrade pip
-pip install -r requirements.txt
-```
+初回ダウンロードが完了するまで数分かかります。ログに「Vision-language model ready」と表示されるまでお待ちください。
 
 ### 3. ChromeDriver の確認
 
 ```bash
-# ChromeDriver がインストールされているか確認
 which chromedriver
-
-# 出力例: /opt/homebrew/bin/chromedriver
-# 何も表示されない場合は以下でインストール:
-brew install chromedriver
 ```
+
+パスが表示されない場合は、使用環境に合わせて ChromeDriver をインストールしてください。Linux では公式サイトからバイナリを配置するか、パッケージマネージャーを利用します。macOS では `brew install chromedriver` が利用できます。
 
 ## ▶️ 起動方法
 
-### 1. Ollama を起動 (ターミナル 1)
+起動は `./start.sh` を再度実行するだけで OK です。仮想環境とモデルが既に存在する場合は高速に起動します。手動で起動する場合は以下を参考にしてください。
 
 ```bash
-ollama serve
-```
-
-### 2. AI Browser Agent を起動 (ターミナル 2)
-
-```bash
-cd /Users/jota/Downloads/agent
 source venv/bin/activate
-python app.py
+python3 app.py
 ```
 
-### 3. ブラウザでアクセス
-
-```
-http://127.0.0.1:5000
-```
+サーバーが起動したらブラウザで `http://127.0.0.1:5000` にアクセスします。
 
 ## 🎮 使い方
 
-1. **Ollama 接続確認**: 右上の "Ollama: llava:13b" が緑のドットなら接続成功
+1. **モデル状態確認**: 右上のステータスが「Local VLM: Qwen/Qwen2-VL-2B-Instruct」で緑のドットならモデル読み込み済み
 
 2. **タスクを入力**: 左サイドバーのテキストエリアに自然言語で指示を入力
 
@@ -102,71 +75,44 @@ http://127.0.0.1:5000
 4. **進行状況を確認**:
 
    - ブラウザ画面に赤いカーソルが表示され、AI の操作位置を示します
-   - 左パネルの "Task Logs" にリアルタイムで操作ログが表示されます
-   - Status セクションに現在のステップ数と状態が表示されます
+   - 左パネルの "Agent Plan" に構造化ステップと達成状況 (例: 3/5) が表示されます
+   - "Task Logs" にリアルタイムで操作ログが表示され、Status セクションに現在のステップ数と状態が表示されます
 
 5. **停止**: "Stop" ボタンでいつでも中断可能
 
 ## 🔧 トラブルシューティング
 
-### Ollama に接続できない
+### モデルの読み込みに失敗する
 
-```bash
-# Ollama が起動しているか確認
-ps aux | grep ollama
-
-# 起動していない場合
-ollama serve
-
-# ポート 11434 が使用中か確認
-lsof -i :11434
-```
-
-### llava:13b モデルがない
-
-```bash
-# 利用可能なモデルを確認
-ollama list
-
-# llava がない場合は再ダウンロード
-ollama pull llava:13b
-```
-
-### AI の応答が遅い・精度が低い
-
-- **llava:7b** を試す (軽量版):
+- メモリ不足の可能性があります。不要なアプリを終了してから再実行してください。
+- モデルファイルが壊れている場合はキャッシュを削除します。
 
   ```bash
-  ollama pull llava:7b
+  rm -rf ~/.cache/huggingface/hub/models--Qwen--Qwen2-VL-2B-Instruct
+  ./start.sh
   ```
 
-  その後、`app.py` の 26 行目を編集:
+- プロキシ環境では `HF_ENDPOINT` を設定するなど、Hugging Face へのアクセスを確認してください。
 
-  ```python
-  OLLAMA_MODEL = "llava:7b"
-  ```
+### 初回ダウンロードが非常に遅い
 
-- **moondream** を試す (超軽量):
+- 4GB 規模のモデルを取得するため、回線状況により時間がかかります。
+- `pip install huggingface_hub` 後に `huggingface-cli download Qwen/Qwen2-VL-2B-Instruct` を先に実行しておくと再利用できます。
+
+### 推論が遅い / 軽量化したい
+
+- GPU がある場合は `CUDA_VISIBLE_DEVICES=0 ./start.sh` のように GPU を割り当ててください。
+- CPU のみで軽量化するには `app.py` の `VLM_MODEL_ID` を `Qwen/Qwen2-VL-7B-Instruct` や `microsoft/Phi-3.5-vision-instruct` に変更し、[Hugging Face](https://huggingface.co/) から該当モデルを取得してください（メモリ要件に注意）。
+
+### ChromeDriver に関するエラー
+
+- `which chromedriver` でパスを確認し、見つからない場合は環境に応じた手段でインストールしてください。
+- バージョン違いの場合はブラウザと同じバージョンを再インストールしてください。
+- Linux で `chromedriver` を実行できない場合は実行権限を付与します。
+
   ```bash
-  ollama pull moondream
+  chmod +x /path/to/chromedriver
   ```
-  `app.py` を編集:
-  ```python
-  OLLAMA_MODEL = "moondream"
-  ```
-
-### ChromeDriver エラー
-
-```bash
-# ChromeDriver のパスを確認
-which chromedriver
-
-# Homebrew で再インストール
-brew reinstall chromedriver
-
-# セキュリティ警告が出た場合
-xattr -d com.apple.quarantine /opt/homebrew/bin/chromedriver
-```
 
 ## ⚙️ カスタマイズ
 
@@ -174,7 +120,7 @@ xattr -d com.apple.quarantine /opt/homebrew/bin/chromedriver
 
 ```python
 # AI 設定
-OLLAMA_MODEL = "llava:13b"       # 使用する AI モデル
+VLM_MODEL_ID = "Qwen/Qwen2-VL-2B-Instruct"  # 使用する視覚言語モデル
 AI_MAX_STEPS = 30                 # 最大ステップ数 (増やすと長いタスクに対応)
 
 # パフォーマンス
@@ -185,11 +131,11 @@ ACTIVE_CAPTURE_DELAY = 0.08       # フレーム間隔 (秒)
 
 ## 📊 推奨モデル比較
 
-| モデル    | サイズ | 速度 | 精度 | RAM 使用量 | 推奨用途         |
-| --------- | ------ | ---- | ---- | ---------- | ---------------- |
-| llava:13b | ~8GB   | 中   | 高   | 16GB+      | 本番・高精度     |
-| llava:7b  | ~4GB   | 速   | 中   | 8GB+       | テスト・バランス |
-| moondream | ~2GB   | 爆速 | 低   | 4GB+       | 開発・動作確認   |
+| モデル                           | サイズ | 速度 | 精度 | RAM 使用量 | 推奨用途               |
+| -------------------------------- | ------ | ---- | ---- | ---------- | ---------------------- |
+| Qwen2-VL-2B-Instruct (デフォルト) | ~4GB   | 中   | 高   | 8GB+       | 汎用ブラウジング       |
+| Qwen2-VL-7B-Instruct             | ~8GB   | やや遅 | 非常に高 | 16GB+      | 精度重視のタスク       |
+| Phi-3.5-vision-instruct          | ~3.5GB | 速   | 中   | 8GB        | 軽量環境・CPU ベース   |
 
 ## 🎯 タスク例
 
