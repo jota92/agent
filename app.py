@@ -1,6 +1,7 @@
 from flask import Flask, Response, render_template_string, request, jsonify
 from selenium import webdriver
 from selenium.webdriver.chrome.options import Options
+from selenium.webdriver.common.keys import Keys
 from selenium.common.exceptions import WebDriverException, NoAlertPresentException
 from selenium.webdriver.common.by import By
 import threading
@@ -118,7 +119,7 @@ def extract_search_query(instruction: str) -> Optional[str]:
             if candidate:
                 return candidate
 
-    google_pattern = re.search(r'googleで(.+?)を?検索', instruction, re.IGNORECASE)
+    google_pattern = re.search(r'googleで(.+?)(?:を?検索|を?調べて)', instruction, re.IGNORECASE)
     if google_pattern:
         candidate = google_pattern.group(1).strip(" 。、,.!?\"'」』 ")
         if candidate:
@@ -185,6 +186,79 @@ def build_forced_type_action(task: AITask, label: str = "recovering search flow"
     next_step = min(max(task.plan_progress + 1, 1), total_steps)
     reasoning = f'Step {next_step}/{total_steps}: typing "{query}" and pressing Enter ({label})'
     return AIAction(action="type", text=f"{query}\\n", reasoning=reasoning)
+
+
+def perform_google_search_entry(query: str, submit: bool) -> bool:
+    """Type into Google's search box using Selenium's native send_keys."""
+    global last_stream_request
+    with lock:
+        if not driver:
+            init_browser()
+        if not driver:
+            return False
+        last_stream_request = time.time()
+        try:
+            # Find the search input element
+            selectors = ["input[name='q']", "textarea[name='q']"]
+            search_input = None
+            for selector in selectors:
+                try:
+                    search_input = driver.find_element(By.CSS_SELECTOR, selector)
+                    break
+                except Exception:
+                    continue
+            
+            if not search_input:
+                print("Google search input not found")
+                return False
+            
+            # Clear existing text and type the query
+            search_input.click()
+            time.sleep(0.1)
+            search_input.clear()
+            time.sleep(0.1)
+            search_input.send_keys(query)
+            time.sleep(0.2)
+            
+            # Submit if requested
+            if submit:
+                search_input.send_keys(Keys.RETURN)
+                time.sleep(0.3)
+            
+            return True
+        except Exception as typing_error:
+            print(f"Google search entry failed: {typing_error}")
+            return False
+
+
+def type_text_via_cdp(segments: List[str]) -> None:
+    """Type text using Selenium's native send_keys with the active element."""
+    global last_stream_request
+    with lock:
+        if not driver:
+            init_browser()
+        if not driver:
+            raise RuntimeError("Browser driver unavailable for typing")
+        last_stream_request = time.time()
+        
+        try:
+            # Get the currently focused element
+            active_element = driver.switch_to.active_element
+            if not active_element:
+                print("⚠️ No active element to type into")
+                return
+            
+            # Type each segment with Enter between them
+            for idx, segment in enumerate(segments):
+                if segment:
+                    active_element.send_keys(segment)
+                    time.sleep(0.05)
+                if idx < len(segments) - 1:
+                    active_element.send_keys(Keys.RETURN)
+                    time.sleep(0.05)
+        except Exception as typing_error:
+            print(f"⚠️ Native typing failed: {typing_error}")
+            raise
 
 
 def find_element_center(selectors: List[str]) -> Optional[tuple]:
@@ -1044,34 +1118,24 @@ def execute_ai_action(action: AIAction, task: AITask) -> bool:
             ensure_text_focus(task)
             normalized_text = action.text.replace("\\n", "\n")
             segments = normalized_text.split("\n")
+            google_handled = False
+            if instruction_mentions_google(task.instruction):
+                # Extract the actual search query from the instruction
+                actual_query = extract_search_query(task.instruction)
+                if actual_query:
+                    should_submit = len(segments) > 1 or normalized_text.endswith("\n")
+                    google_handled = perform_google_search_entry(actual_query, should_submit)
+                    if google_handled:
+                        submit_text = " and submitted" if should_submit else ""
+                        task.logs.append(f"🔎 Google search: typed '{actual_query}'{submit_text}")
 
-            with lock:
-                if not driver:
-                    init_browser()
-                if not driver:
-                    raise RuntimeError("Browser driver unavailable for typing")
-                last_stream_request = time.time()
-
-                for idx, segment in enumerate(segments):
-                    if segment:
-                        driver.execute_cdp_cmd('Input.insertText', {'text': segment})
-                        time.sleep(0.05)
-                    if idx < len(segments) - 1:
-                        driver.execute_cdp_cmd('Input.dispatchKeyEvent', {
-                            'type': 'rawKeyDown',
-                            'key': 'Enter',
-                            'code': 'Enter',
-                            'windowsVirtualKeyCode': 13,
-                            'nativeVirtualKeyCode': 13
-                        })
-                        driver.execute_cdp_cmd('Input.dispatchKeyEvent', {
-                            'type': 'keyUp',
-                            'key': 'Enter',
-                            'code': 'Enter',
-                            'windowsVirtualKeyCode': 13,
-                            'nativeVirtualKeyCode': 13
-                        })
-                        time.sleep(0.05)
+            if not google_handled:
+                try:
+                    type_text_via_cdp(segments)
+                except Exception as typing_error:
+                    task.logs.append(f"⚠️ Direct typing failed: {typing_error}. Restarting browser.")
+                    restart_browser_locked(f"typing failure: {typing_error}")
+                    raise
 
             enter_count = max(0, len(segments) - 1)
             typed_preview = normalized_text.replace("\n", "\\n")
@@ -1283,8 +1347,7 @@ def ai_agent_loop(task_id: str):
                         task.logs.append("🔄 Forcing type action to break loop")
                         print("🔄 Too many similar clicks, forcing type action")
                         # 検索クエリを抽出
-                        match = re.search(r'["\'](.+?)["\'].*検索', task.instruction)
-                        search_query = match.group(1) if match else "検索"
+                        search_query = extract_search_query(task.instruction) or "search"
                         action = AIAction(action="type", text=f"{search_query}\\n", reasoning="Forced action to break click loop")
                         consecutive_click_count = 0
                         last_click_pos = None
