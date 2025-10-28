@@ -1,127 +1,120 @@
-# AI Browser Agent 🤖
+# Browser Automation Agent
 
-AIがブラウザを自動操作するローカルエージェントシステム。視覚認識モデルを使用してウェブページを理解し、マウスカーソルを動かして実際にクリックやタイピングを実行します。
+Autonomous web browser control system powered by vision-language models. The agent analyzes screenshots, plans actions, and executes mouse clicks and keyboard inputs to complete web tasks.
 
-## 特徴 ✨
+## Features
 
-- **🎯 視覚的AI操作**: Qwen2-VL-2B Instruct モデルでスクリーンショットを解析
-- **🧭 構造化プランナー**: タスクを細かなサブステップに自動分解し、"Googleを開く → ボックスをクリック → 入力 → Enter → 結果を選択" のように順番を厳守
-- **👁️ 常時モニタリング**: DOM 完了待機 + 画面ハッシュ監視でスタックを検知し、必要に応じて自動リフレッシュ
-- **🖱️ リアルタイムカーソル**: AIが操作する巨大なカーソルをブラウザ上に表示
-- **📊 座標グリッド**: 100px間隔のグリッドで正確な座標指定
-- **🔄 スムーズアニメーション**: カーソルが滑らかに移動（20ステップ、smoothstep）
-- **🛡️ ループ防止とポップアップ対応**: 近接クリック防止、警告ダイアログ自動閉じ、失敗時の強制遷移
-- **🎨 ライブストリーミング + プランビューワ**: カーソル軌跡に加えて、左パネルに進行中のプランと達成率を表示
+- **Visual Understanding**: Uses Qwen2-VL-2B-Instruct to interpret web pages from screenshots
+- **Task Planning**: Breaks down complex instructions into sequential steps
+- **Real-time Monitoring**: Tracks DOM state and detects page changes
+- **Coordinate Grid Overlay**: 100px grid with labels for precise navigation
+- **Cursor Animation**: Smooth 20-step interpolation for natural movement
+- **Loop Prevention**: Detects repeated actions and forces progress
+- **Error Handling**: Auto-dismisses JavaScript dialogs and handles timeouts
+- **Live Streaming**: Real-time browser view with plan progress tracking
 
-## 必要要件 📋
+## Requirements
 
-- Linux または macOS
+- Linux or macOS
 - Python 3.8+
 - ChromeDriver
 
-## セットアップ 🚀
+## Installation
 
-1. **リポジトリをクローン**
+1. **Clone the repository**
 ```bash
 git clone https://github.com/YOUR_USERNAME/agent.git
 cd agent
 ```
 
-2. **クイックスタート**
+2. **Run setup script**
 ```bash
 chmod +x start.sh
 ./start.sh
 ```
 
-このスクリプトが自動的に:
-- Python仮想環境のセットアップ
-- 依存関係のインストール
-- Qwen2-VL-2B Instruct モデルのダウンロード（初回のみ）
-- サーバーの起動
+The script will:
+- Create a Python virtual environment
+- Install dependencies
+- Download the Qwen2-VL-2B-Instruct model (first run only)
+- Start the server
 
-3. **ブラウザでアクセス**
+3. **Access the interface**
 ```
 http://127.0.0.1:5000
 ```
 
-## 使い方 💡
+## Usage
 
-1. ブラウザで http://127.0.0.1:5000 を開く
-2. URLを入力してブラウザを開く
-3. タスクを入力（例: "googleで'openai'を検索して最初の結果をクリックしてください"）
-4. "Start AI Agent" をクリック
-5. 左サイドバーの **Agent Plan** でサブステップの進捗を確認しながら、AI がカーソルを動かして自動操作するのを観察
+1. Open http://127.0.0.1:5000 in your browser
+2. Enter a task in the text area (e.g., "Search for 'OpenAI' on Google and click the first result")
+3. Click "Start Task"
+4. Monitor progress in the sidebar and watch the cursor perform actions
 
-## 技術スタック 🔧
+## Technical Stack
 
-- **バックエンド**: Flask (Python)
-- **ブラウザ制御**: Selenium + Chrome DevTools Protocol
-- **AI モデル**: Qwen2-VL-2B Instruct (Transformers)
-- **画像処理**: Pillow
-- **フロントエンド**: HTML/JavaScript (MJPEG streaming)
+- **Backend**: Flask (Python)
+- **Browser Control**: Selenium WebDriver + Chrome DevTools Protocol
+- **Vision Model**: Qwen2-VL-2B-Instruct (Transformers, PyTorch)
+- **Image Processing**: Pillow
+- **Frontend**: HTML/JavaScript with MJPEG streaming
 
-## 主な機能 🎨
+## Architecture
 
-### AIカーソル
-- 80px巨大グロー効果
-- 赤いクロスヘア
-- スムーズな移動アニメーション
+### Cursor Visualization
+- Animated pointer with glow effect
+- Smooth interpolation between positions
+- Overlay on coordinate grid
 
-### 座標グリッド
-- 黄色の100pxグリッド
-- X/Y座標ラベル
-- 中心マーカー
+### Coordinate Grid
+- Yellow 100px grid lines
+- Axis labels and quadrant markers
+- Center crosshair for reference
 
-### 構造化プランナー
-- 指示文から検索キーワードを抽出
-- Google系タスクは 5 ステップ定型（Google を開く→クリック→入力→Enter→結果クリック）
-- 進行中のステップを UI に表示して失敗ポイントを迅速に把握
+### Task Planner
+- Extracts search queries from natural language
+- Generates step-by-step execution plans
+- Tracks completion progress
 
-### ループ防止システム
-1. 完全一致アクション検出
-2. 近接座標検出（100px閾値）
-3. 強制アクションオーバーライド
+### Reliability Features
+- Duplicate action detection
+- Proximity-based click filtering (100px threshold)
+- Forced action injection to break loops
+- DOM readiness polling
+- Page reload on visual stall detection
+- Automatic alert dismissal
 
-### イレギュラー検知
-- DOM readyState を監視して操作タイミングを最適化
-- 連続スクリーンショットが同一なら自動でページをリロード
-- JavaScript alert / confirm / prompt を自動承認して操作を継続
+## API Endpoints
 
-## API エンドポイント 📡
+- `GET /` - Main web interface
+- `GET /stream` - MJPEG video stream
+- `POST /ai/task` - Start new automation task
+- `GET /ai/status/<task_id>` - Get task status
+- `POST /ai/stop/<task_id>` - Stop running task
+- `GET /ai/health` - Check model availability
 
-- `GET /` - メインUI
-- `GET /stream` - MJPEGビデオストリーム
-- `POST /ai/task` - AIタスク開始
-- `GET /ai/status/<task_id>` - タスクステータス
-- `POST /ai/stop/<task_id>` - タスク停止
-- `GET /ai/health` - ヘルスチェック
+## Configuration
 
-## 設定 ⚙️
-
-`app.py`で以下をカスタマイズ可能:
+Customize behavior in `app.py`:
 
 ```python
-VLM_MODEL_ID = "Qwen/Qwen2-VL-2B-Instruct"  # 使用する視覚言語モデル
-AI_MAX_STEPS = 30                     # 最大ステップ数
-AI_STEP_TIMEOUT = 15                  # タイムアウト（秒）
-JPEG_QUALITY = 65                     # ストリーム画質
-TARGET_STREAM_WIDTH = 1024            # ストリーム幅
+VLM_MODEL_ID = "Qwen/Qwen2-VL-2B-Instruct"  # Vision-language model
+AI_MAX_STEPS = 30                            # Maximum steps per task
+AI_STEP_TIMEOUT = 15                         # Step timeout in seconds
+JPEG_QUALITY = 65                            # Stream image quality
+TARGET_STREAM_WIDTH = 1024                   # Stream width in pixels
 ```
 
-## ライセンス 📄
+## License
 
 MIT License
 
-## 注意事項 ⚠️
+## Limitations
 
-- これは開発サーバーです。本番環境では使用しないでください
-- AIの操作は完璧ではありません
-- ローカルでのみ動作します（セキュリティ上の理由）
+- Development server only - not suitable for production
+- Autonomous actions may not always succeed
+- Requires local execution for security
 
-## 貢献 🤝
+## Contributing
 
-プルリクエスト歓迎！
-
-## 作者 👨‍💻
-
-Created with ❤️ using AI assistance
+Pull requests are welcome. For major changes, please open an issue first to discuss proposed modifications.

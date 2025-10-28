@@ -2,8 +2,10 @@ from flask import Flask, Response, render_template_string, request, jsonify
 from selenium import webdriver
 from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.common.keys import Keys
-from selenium.common.exceptions import WebDriverException, NoAlertPresentException
+from selenium.common.exceptions import WebDriverException, NoAlertPresentException, TimeoutException
 from selenium.webdriver.common.by import By
+from urllib3.exceptions import MaxRetryError, ReadTimeoutError
+from requests.exceptions import ReadTimeout
 import threading
 import time
 import io
@@ -12,12 +14,14 @@ import base64
 import os
 import re
 import hashlib
+import platform
 import torch
 from PIL import Image, ImageDraw
 from transformers import AutoModelForImageTextToText, AutoProcessor
 from dataclasses import dataclass, asdict
 from typing import Optional, List, Dict
 from enum import Enum
+import urllib.parse
 
 app = Flask(__name__)
 driver = None
@@ -26,6 +30,124 @@ current_frame = None
 running = True
 frame_size = (1280, 800)
 last_stream_request = 0.0
+ai_last_cursor_position = None
+
+RECOVERABLE_DRIVER_ERRORS = (
+    TimeoutException,
+    MaxRetryError,
+    ReadTimeoutError,
+    ReadTimeout,
+    WebDriverException,
+)
+
+
+def call_driver(description: str, func, retries: int = 1, recover: bool = True):
+    """Execute a Selenium call with automatic recovery on transient failures."""
+    attempt = 0
+    while attempt <= retries:
+        try:
+            with lock:
+                if not driver:
+                    init_browser()
+                if not driver:
+                    raise RuntimeError("WebDriver not available")
+                result = func(driver)
+            return result
+        except RECOVERABLE_DRIVER_ERRORS as exc:
+            if isinstance(exc, NoAlertPresentException):
+                raise
+            if not recover:
+                raise
+            message = f"{description} failure (attempt {attempt + 1}/{retries + 1}): {exc}"
+            print(f"⚠️ {message}")
+            restart_browser_locked(message)
+            attempt += 1
+            time.sleep(1)
+        except Exception:
+            raise
+    raise RuntimeError(f"{description} failed after {retries + 1} attempts")
+
+
+def safe_get_screenshot() -> Optional[bytes]:
+    try:
+        data = call_driver("get screenshot", lambda d: d.get_screenshot_as_png(), retries=1)
+        if data:
+            global last_stream_request
+            last_stream_request = time.time()
+        return data
+    except Exception as exc:
+        print(f"⚠️ Screenshot capture failed: {exc}")
+        return None
+
+
+def safe_execute_cdp(command: str, params: Optional[dict] = None):
+    result = call_driver(f"CDP {command}", lambda d: d.execute_cdp_cmd(command, params or {}), retries=1)
+    global last_stream_request
+    last_stream_request = time.time()
+    return result
+
+
+def safe_execute_script(script: str, *args):
+    result = call_driver("execute script", lambda d: d.execute_script(script, *args))
+    global last_stream_request
+    last_stream_request = time.time()
+    return result
+
+
+def safe_get(url: str):
+    return call_driver(f"navigate to {url}", lambda d: d.get(url), retries=1)
+
+
+def safe_refresh():
+    return call_driver("refresh page", lambda d: d.refresh(), retries=1)
+
+
+def safe_active_element():
+    return call_driver("get active element", lambda d: d.switch_to.active_element, retries=1)
+ai_last_cursor_position = None
+
+def get_primary_modifier_key() -> str:
+    """Return the platform-appropriate primary modifier for shortcuts."""
+    system = platform.system().lower()
+    return Keys.COMMAND if system == "darwin" else Keys.CONTROL
+
+
+def send_keys_to_active(keys, chord: bool = False) -> bool:
+    """Send key(s) to the currently focused element."""
+    def _send(d: webdriver.Chrome):
+        try:
+            target = d.switch_to.active_element
+        except Exception:
+            target = None
+        if not target:
+            return False
+        if chord:
+            target.send_keys(Keys.chord(*keys))
+        else:
+            if isinstance(keys, (list, tuple)):
+                target.send_keys(*keys)
+            else:
+                target.send_keys(keys)
+        time.sleep(0.05)
+        return True
+
+    try:
+        result = call_driver("send keys", _send, retries=1)
+        if result:
+            global last_stream_request
+            last_stream_request = time.time()
+        return bool(result)
+    except Exception as exc:
+        print(f"send_keys_to_active error: {exc}")
+        return False
+
+
+def enqueue_pending_action(task: 'AITask', action: Optional['AIAction']):
+    """Thread-safe helper to append follow-up actions."""
+    if not action:
+        return
+    with ai_task_lock:
+        task.pending_actions.append(action)
 
 # AI Configuration
 VLM_MODEL_ID = "Qwen/Qwen2-VL-2B-Instruct"
@@ -77,6 +199,9 @@ class AITask:
     plan_progress: int = 0
     stalled_frames: int = 0
     last_frame_hash: Optional[str] = None
+    google_retry_count: int = 0
+    google_direct_used: bool = False
+    pending_actions: List['AIAction'] = None
 
     def __post_init__(self):
         if self.logs is None:
@@ -87,6 +212,8 @@ class AITask:
             self.plan_steps = []
         if self.created_at == 0:
             self.created_at = time.time()
+        if self.pending_actions is None:
+            self.pending_actions = []
 
 ai_tasks: Dict[str, AITask] = {}
 ai_task_lock = threading.Lock()
@@ -137,6 +264,21 @@ def extract_search_query(instruction: str) -> Optional[str]:
     return None
 
 
+def extract_url_from_instruction(instruction: str) -> Optional[str]:
+    if not instruction:
+        return None
+    url_regex = re.search(r'(https?://[\w\-./?=&%#]+)', instruction, re.IGNORECASE)
+    if url_regex:
+        return url_regex.group(1)
+    domain_regex = re.search(r'([a-z0-9.-]+\.[a-z]{2,})(?:/[^\s]*)?', instruction, re.IGNORECASE)
+    if domain_regex:
+        domain = domain_regex.group(1)
+        if not domain.lower().startswith('http'):
+            domain = "https://" + domain
+        return domain
+    return None
+
+
 def build_task_plan(instruction: str) -> List[str]:
     """Create a lightweight, deterministic action plan from the natural instruction."""
     plan: List[str] = []
@@ -146,12 +288,18 @@ def build_task_plan(instruction: str) -> List[str]:
     if "google" in normalized or "検索" in normalized:
         plan.append("Open https://www.google.com so the Google homepage is visible.")
         plan.append("Precisely click inside Google's search box to focus it.")
-        plan.append(f"Type \"{search_query}\" into the search field and press Enter to run the search.")
+        plan.append(f"Type \"{search_query}\" into Google's search field.")
+        plan.append("Press Enter to submit the Google search.")
         plan.append("Wait for the result page to finish rendering, then click the very first organic result.")
         plan.append("Confirm the opened page satisfies the instruction before finishing.")
     else:
-        plan.append("Inspect the current page layout and locate the target area.")
-        plan.append(f"Execute the instruction: {instruction}")
+        target_url = extract_url_from_instruction(instruction)
+        if target_url:
+            plan.append(f"Open the URL {target_url} in the browser.")
+            plan.append("Inspect the loaded page and ensure it matches the requested destination.")
+        else:
+            plan.append("Inspect the current page layout and locate the target area.")
+            plan.append(f"Execute the instruction: {instruction}")
         plan.append("Validate that the requested goal is achieved, handling any popups or errors.")
 
     plan.append("Stay alert for unexpected dialogs or errors and resolve them before continuing.")
@@ -184,108 +332,257 @@ def build_forced_type_action(task: AITask, label: str = "recovering search flow"
     query = extract_search_query(task.instruction) or "search"
     total_steps = len(task.plan_steps) or 4
     next_step = min(max(task.plan_progress + 1, 1), total_steps)
-    reasoning = f'Step {next_step}/{total_steps}: typing "{query}" and pressing Enter ({label})'
-    return AIAction(action="type", text=f"{query}\\n", reasoning=reasoning)
+    reasoning = f'Step {next_step}/{total_steps}: typing \"{query}\" ({label})'
+    follow_reason = f'Step {next_step}/{total_steps}: pressing Enter to submit ({label})'
+    enqueue_pending_action(task, AIAction(action="press_enter", reasoning=follow_reason, plan_step=next_step))
+    return AIAction(action="type", text=query, reasoning=reasoning, plan_step=next_step)
 
 
-def perform_google_search_entry(query: str, submit: bool) -> bool:
+def handle_google_consent() -> bool:
+    """Click Google consent dialogs if they appear."""
+    selectors = [
+        "button#L2AGLb",
+        "form[action*='consent'] button",
+        "button[aria-label*='同意']",
+        "button[aria-label*='accept']",
+        "button[jsname='b3VHJd']",
+    ]
+
+    def _handle(d: webdriver.Chrome):
+        for selector in selectors:
+            elements = d.find_elements(By.CSS_SELECTOR, selector)
+            if not elements:
+                continue
+            for element in elements:
+                try:
+                    d.execute_script("arguments[0].click();", element)
+                    time.sleep(0.2)
+                    return True
+                except Exception:
+                    continue
+        return False
+
+    try:
+        return call_driver("handle google consent", _handle, retries=1)
+    except Exception as exc:
+        print(f"Consent handling error: {exc}")
+        return False
+
+
+def perform_google_search_entry(text: str, submit: bool, clear: bool = True) -> bool:
     """Type into Google's search box using Selenium's native send_keys."""
-    global last_stream_request
-    with lock:
-        if not driver:
-            init_browser()
-        if not driver:
+    def _entry(d: webdriver.Chrome):
+        selectors = ["input[name='q']", "textarea[name='q']"]
+        search_input = None
+        for selector in selectors:
+            try:
+                search_input = d.find_element(By.CSS_SELECTOR, selector)
+                break
+            except Exception:
+                continue
+        if not search_input:
             return False
-        last_stream_request = time.time()
+
         try:
-            # Find the search input element
+            d.execute_script("arguments[0].focus();", search_input)
+        except Exception:
+            search_input.click()
+        time.sleep(0.05)
+        if clear:
+            try:
+                search_input.clear()
+            except Exception:
+                pass
+            time.sleep(0.05)
+        if text:
+            search_input.send_keys(text)
+            time.sleep(0.05)
+        if submit:
+            search_input.send_keys(Keys.RETURN)
+            time.sleep(0.1)
+        return True
+
+    try:
+        result = call_driver("google search entry", _entry, retries=1)
+        if result:
+            global last_stream_request
+            last_stream_request = time.time()
+        else:
+            print("Google search input not found")
+        return bool(result)
+    except Exception as typing_error:
+        print(f"Google search entry failed: {typing_error}")
+        return False
+
+
+def submit_google_search() -> bool:
+    """Send ENTER to the active element (Google search input) to trigger the search."""
+    def _submit(d: webdriver.Chrome):
+        try:
+            target = d.switch_to.active_element
+        except Exception:
+            target = None
+        if not target:
             selectors = ["input[name='q']", "textarea[name='q']"]
-            search_input = None
             for selector in selectors:
                 try:
-                    search_input = driver.find_element(By.CSS_SELECTOR, selector)
+                    target = d.find_element(By.CSS_SELECTOR, selector)
                     break
                 except Exception:
                     continue
-            
-            if not search_input:
-                print("Google search input not found")
-                return False
-            
-            # Clear existing text and type the query
-            search_input.click()
-            time.sleep(0.1)
-            search_input.clear()
-            time.sleep(0.1)
-            search_input.send_keys(query)
-            time.sleep(0.2)
-            
-            # Submit if requested
-            if submit:
-                search_input.send_keys(Keys.RETURN)
-                time.sleep(0.3)
-            
-            return True
-        except Exception as typing_error:
-            print(f"Google search entry failed: {typing_error}")
+        if not target:
             return False
+        target.send_keys(Keys.RETURN)
+        time.sleep(0.1)
+        return True
+
+    try:
+        result = call_driver("google search submit", _submit, retries=1)
+        if result:
+            global last_stream_request
+            last_stream_request = time.time()
+        return bool(result)
+    except Exception as exc:
+        print(f"Google submit failed: {exc}")
+        return False
 
 
-def type_text_via_cdp(segments: List[str]) -> None:
-    """Type text using Selenium's native send_keys with the active element."""
-    global last_stream_request
-    with lock:
-        if not driver:
-            init_browser()
-        if not driver:
-            raise RuntimeError("Browser driver unavailable for typing")
-        last_stream_request = time.time()
-        
+def type_text_via_cdp(text: str) -> bool:
+    """Type text into the currently focused element."""
+
+    def _type(d: webdriver.Chrome):
         try:
-            # Get the currently focused element
-            active_element = driver.switch_to.active_element
-            if not active_element:
-                print("⚠️ No active element to type into")
-                return
-            
-            # Type each segment with Enter between them
-            for idx, segment in enumerate(segments):
-                if segment:
-                    active_element.send_keys(segment)
-                    time.sleep(0.05)
-                if idx < len(segments) - 1:
-                    active_element.send_keys(Keys.RETURN)
-                    time.sleep(0.05)
-        except Exception as typing_error:
-            print(f"⚠️ Native typing failed: {typing_error}")
-            raise
+            active_element = d.switch_to.active_element
+        except Exception:
+            active_element = None
+        if not active_element:
+            return False
+        if text:
+            active_element.send_keys(text)
+            time.sleep(0.05)
+        return True
+
+    try:
+        result = call_driver("type text", _type, retries=1)
+        global last_stream_request
+        last_stream_request = time.time()
+        return bool(result)
+    except Exception as exc:
+        print(f"Type via CDP failed: {exc}")
+        return False
+
+
+def handle_text_input_action(
+    task: 'AITask',
+    action: AIAction,
+    *,
+    allow_google_helper: bool = True,
+    log_prefix: str = "⌨️ Typed"
+) -> bool:
+    """Common handler for text insertion actions (type/paste)."""
+    global ai_cursor_position, ai_last_cursor_position
+    text = action.text or ""
+    normalized = text.replace("\r\n", "\n").replace("\r", "\n")
+    normalized = normalized.replace("\\r", "").replace("\\n", "\n")
+    segments = normalized.split("\n")
+    first_segment = segments[0] if segments else ""
+    remainder = segments[1:] if len(segments) > 1 else []
+
+    ensure_text_focus(task)
+
+    typed_now = False
+    typed_via_google = False
+    if first_segment:
+        if allow_google_helper and instruction_mentions_google(task.instruction):
+            typed_via_google = perform_google_search_entry(first_segment, submit=False)
+        if not typed_via_google:
+            typed_now = type_text_via_cdp(first_segment)
+            if not typed_now:
+                task.logs.append(f"⚠️ Typing failed (no focused element) - {action.reasoning}")
+                return False
+        else:
+            typed_now = True
+        truncated = first_segment if len(first_segment) <= 80 else first_segment[:77] + "..."
+        if typed_via_google and instruction_mentions_google(task.instruction):
+            task.logs.append(f"🔎 Google search: typed '{truncated}' - {action.reasoning}")
+        else:
+            task.logs.append(f"{log_prefix}: '{truncated}' - {action.reasoning}")
+    elif not remainder:
+        task.logs.append(f"⚠️ {log_prefix} skipped: no text provided - {action.reasoning}")
+        return False
+
+    if remainder:
+        follow_reason = action.reasoning or "Follow-up input"
+        for segment in remainder:
+            enqueue_pending_action(task, AIAction(
+                action="press_enter",
+                reasoning=f"{follow_reason} (press Enter)",
+                plan_step=action.plan_step
+            ))
+            task.logs.append(f"↩️ Queued Enter for newline continuation - {follow_reason}")
+            if segment:
+                enqueue_pending_action(task, AIAction(
+                    action="type",
+                    text=segment,
+                    reasoning=f"{follow_reason} (continued)",
+                    plan_step=action.plan_step
+                ))
+    elif allow_google_helper and instruction_mentions_google(task.instruction):
+        with ai_task_lock:
+            has_pending_enter = any(p.action == "press_enter" for p in task.pending_actions)
+        if not has_pending_enter:
+            total_steps = len(task.plan_steps) or max(action.plan_step or 0, task.plan_progress or 0, 1)
+            next_step = (action.plan_step + 1) if action.plan_step else max(task.plan_progress + 1, 1)
+            if total_steps and next_step > total_steps:
+                next_step = total_steps
+            enqueue_pending_action(task, AIAction(
+                action="press_enter",
+                reasoning=f"Step {next_step}/{total_steps or next_step}: pressing Enter after typing the query",
+                plan_step=next_step
+            ))
+            task.logs.append("↩️ Queued Enter to submit Google search automatically")
+
+    wait_for_dom_idle(task, "type")
+    with ai_task_lock:
+        if ai_cursor_position:
+            ai_last_cursor_position = ai_cursor_position
+        elif ai_last_cursor_position:
+            ai_cursor_position = ai_last_cursor_position
+        task.ai_cursor_pos = ai_cursor_position or ai_last_cursor_position
+    handled = typed_now or bool(remainder)
+    return handled
 
 
 def find_element_center(selectors: List[str]) -> Optional[tuple]:
     """Locate an element via CSS selectors and return its viewport center coordinates."""
-    with lock:
-        if not driver:
-            init_browser()
-        if not driver:
-            return None
+    def _locate(d: webdriver.Chrome):
         for selector in selectors:
             try:
-                element = driver.find_element(By.CSS_SELECTOR, selector)
+                element = d.find_element(By.CSS_SELECTOR, selector)
             except Exception:
                 continue
             try:
-                driver.execute_script("arguments[0].scrollIntoView({block: 'center', inline: 'center'});", element)
-                rect = driver.execute_script("""
+                d.execute_script("arguments[0].scrollIntoView({block: 'center', inline: 'center'});", element)
+                rect = d.execute_script(
+                    """
                     const r = arguments[0].getBoundingClientRect();
                     return {x: r.left, y: r.top, width: r.width, height: r.height};
-                """, element)
+                    """,
+                    element,
+                )
             except Exception:
                 continue
             if rect and rect.get('width', 0) > 1 and rect.get('height', 0) > 1:
                 center_x = int(rect['x'] + rect['width'] / 2)
                 center_y = int(rect['y'] + rect['height'] / 2)
                 return (center_x, center_y)
-    return None
+        return None
+
+    try:
+        return call_driver("locate element center", _locate, retries=1)
+    except Exception as exc:
+        print(f"Element center lookup failed: {exc}")
+        return None
 
 
 def auto_target_click(action: AIAction, task: AITask) -> bool:
@@ -302,6 +599,7 @@ def auto_target_click(action: AIAction, task: AITask) -> bool:
     if not needs_help:
         return False
 
+    handle_google_consent()
     query = extract_search_query(task.instruction) or ""
     updated = False
     if step_hint == 2:
@@ -327,6 +625,65 @@ def auto_target_click(action: AIAction, task: AITask) -> bool:
     return updated
 
 
+def check_google_results_state(query: str) -> tuple[bool, bool]:
+    """Return (results_present, query_matches)."""
+
+    def _status(d: webdriver.Chrome):
+        url = d.current_url or ""
+        try:
+            input_value = d.find_element(By.CSS_SELECTOR, "input[name='q']").get_attribute("value") or ""
+        except Exception:
+            input_value = ""
+        try:
+            has_results = bool(d.find_elements(By.CSS_SELECTOR, "div#search h3"))
+        except Exception:
+            has_results = False
+        return url, input_value.strip(), has_results
+
+    try:
+        url, input_value, has_results = call_driver("check google results", _status, retries=1)
+    except Exception as exc:
+        print(f"Google result check failed: {exc}")
+        return False, False
+
+    url_ok = "/search" in url.lower()
+    text_ok = input_value.lower() == query.lower()
+    return url_ok and has_results, text_ok
+
+
+def wait_for_google_results(query: str, timeout: float = 8.0, poll: float = 0.6) -> bool:
+    """Wait until Google finishes rendering search results for the query."""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        ok, text_ok = check_google_results_state(query)
+        if ok and text_ok:
+            return True
+        time.sleep(poll)
+    return False
+
+
+def navigate_direct_google_search(task: AITask, query: str) -> bool:
+    """Fallback: open Google results directly via query URL."""
+    encoded = urllib.parse.quote_plus(query)
+    target_url = f"https://www.google.com/search?q={encoded}&hl=ja"
+    try:
+        safe_get(target_url)
+        wait_for_dom_idle(task, "direct google navigation")
+        if handle_google_consent():
+            task.logs.append("✅ Google consent dialog accepted")
+            wait_for_dom_idle(task, "consent acceptance")
+        success = wait_for_google_results(query, timeout=6.0)
+        if success:
+            task.logs.append(f"🔗 Opened Google results via direct URL for '{query}'")
+            task.google_direct_used = True
+            task.google_retry_count = 0
+            return True
+        task.logs.append(f"⚠️ Direct navigation did not reveal results for '{query}'")
+    except Exception as exc:
+        task.logs.append(f"⚠️ Direct Google navigation failed: {exc}")
+    return False
+
+
 def ensure_text_focus(task: AITask):
     """Ensure the most relevant text input is focused before typing."""
     if not instruction_mentions_google(task.instruction):
@@ -337,12 +694,9 @@ def ensure_text_focus(task: AITask):
         "form[action='/search'] input[type='text']",
     ]
     try:
-        with lock:
-            if not driver:
-                init_browser()
-            if not driver:
-                return
-            driver.execute_script(
+        call_driver(
+            "ensure text focus",
+            lambda d: d.execute_script(
                 """
                 const selectors = arguments[0];
                 for (const sel of selectors) {
@@ -358,8 +712,10 @@ def ensure_text_focus(task: AITask):
                     }
                 }
                 """,
-                selectors
-            )
+                selectors,
+            ),
+            retries=1,
+        )
     except Exception as exc:
         print(f"Focus helper failed: {exc}")
 
@@ -370,18 +726,19 @@ def ensure_search_start(task: AITask):
     if not instruction_mentions_google(task.instruction):
         return
     try:
-        opened = False
-        with lock:
-            if not driver:
-                init_browser()
-            if driver:
-                current_url = driver.current_url
-                if "google" not in current_url.lower():
-                    driver.get("https://www.google.com")
-                    last_stream_request = time.time()
-                    opened = True
+        def _maybe_open(d: webdriver.Chrome):
+            current_url = d.current_url or ""
+            if "google" not in current_url.lower():
+                d.get("https://www.google.com")
+                return True
+            return False
+
+        opened = call_driver("ensure google start", _maybe_open, retries=1)
         if opened:
+            last_stream_request = time.time()
             task.logs.append("🔎 Auto-opened Google to start the search workflow")
+        if handle_google_consent():
+            task.logs.append("✅ Google consent dialog accepted")
     except Exception as exc:
         task.logs.append(f"⚠️ Failed to auto-open Google: {exc}")
 
@@ -435,11 +792,11 @@ def update_plan_progress(task: AITask, action: AIAction):
 
 def build_verification_question(task: AITask) -> Optional[str]:
     query = extract_search_query(task.instruction) or "the requested topic"
-    if task.plan_progress == 3:
-        return f"Is the Google search results page visible with results for \"{query}\" instead of the blank homepage?"
     if task.plan_progress == 4:
+        return f"Is the Google search results page visible with results for \"{query}\" instead of the blank homepage?"
+    if task.plan_progress == 5:
         return f"Has the first Google search result for \"{query}\" been opened or at least highlighted so it is clearly active?"
-    if task.plan_progress >= 5:
+    if task.plan_progress >= 6:
         return f"Does the current page appear to belong to the requested destination for \"{query}\" (for example openai.com) rather than Google results?"
     return None
 
@@ -501,25 +858,35 @@ Answer with only 'yes' or 'no'. Do not add explanations."""
 
 
 def verify_visual_progress(task: AITask):
+    global last_stream_request
     question = build_verification_question(task)
     if not question:
         return
-    try:
-        with lock:
-            if not driver:
-                init_browser()
-            if not driver:
-                return
-            screenshot = driver.get_screenshot_as_png()
-    except Exception as exc:
-        task.logs.append(f"⚠️ Failed to capture screenshot for verification: {exc}")
+    screenshot = safe_get_screenshot()
+    if not screenshot:
+        task.logs.append("⚠️ Failed to capture screenshot for verification")
         return
+    last_stream_request = time.time()
     image_b64 = base64.b64encode(screenshot).decode('utf-8')
     result = call_vlm_verification(image_b64, question)
     if result is True:
         task.logs.append(f"👁️ Visual verification passed: {question}")
     elif result is False:
         task.logs.append(f"⚠️ Visual verification failed: {question}")
+        if "results page" in question.lower():
+            query = extract_search_query(task.instruction) or ""
+            if query:
+                if not wait_for_google_results(query, timeout=6.0):
+                    task.logs.append("🔁 Retrying Google submission after failed verification")
+                    perform_google_search_entry(query, True, clear=False)
+                    wait_for_dom_idle(task, "post-verification retry")
+                    if not wait_for_google_results(query, timeout=6.0):
+                        if not task.google_direct_used:
+                            task.logs.append("⚠️ Verification retry failed; opening direct results URL")
+                            if navigate_direct_google_search(task, query):
+                                task.google_retry_count = 0
+                        else:
+                            task.logs.append("⚠️ Verification retry failed even after direct URL")
         with ai_task_lock:
             task.plan_progress = max(0, task.plan_progress - 1)
     else:
@@ -528,19 +895,20 @@ def verify_visual_progress(task: AITask):
 
 def wait_for_dom_idle(task: AITask, label: str = "", timeout: float = 6.0, poll_interval: float = 0.3) -> bool:
     """Wait until document.readyState settles to 'complete' twice in a row."""
-    if not driver:
-        return False
     end_time = time.time() + timeout
     consecutive_complete = 0
     while time.time() < end_time:
         try:
-            with lock:
-                if not driver:
-                    init_browser()
-                if not driver:
-                    return False
-                state = driver.execute_script("return document.readyState")
-        except WebDriverException as exc:
+            state = call_driver(
+                "read document.readyState",
+                lambda d: d.execute_script("return document.readyState"),
+                retries=0,
+                recover=False,
+            )
+        except TimeoutException:
+            task.logs.append(f"⚠️ DOM ready check timed out ({label}); continuing")
+            return False
+        except Exception as exc:
             task.logs.append(f"⚠️ Failed to read DOM state ({label}): {exc}")
             return False
         if state == "complete":
@@ -556,21 +924,16 @@ def wait_for_dom_idle(task: AITask, label: str = "", timeout: float = 6.0, poll_
 
 def dismiss_js_alerts(task: AITask) -> bool:
     """Close blocking JavaScript alerts, confirmations, or prompts if present."""
-    if not driver:
-        return False
     try:
-        with lock:
-            if not driver:
-                return False
-            try:
-                alert = driver.switch_to.alert
-            except NoAlertPresentException:
-                return False
-            except Exception as exc:
-                task.logs.append(f"⚠️ Alert detection failed: {exc}")
-                return False
-            text = (alert.text or "").strip()
-            alert.accept()
+        alert = call_driver("detect alert", lambda d: d.switch_to.alert, retries=1)
+    except NoAlertPresentException:
+        return False
+    except Exception as exc:
+        task.logs.append(f"⚠️ Alert detection failed: {exc}")
+        return False
+    text = (alert.text or "").strip()
+    try:
+        alert.accept()
     except Exception as exc:
         task.logs.append(f"⚠️ Failed to dismiss alert: {exc}")
         return False
@@ -630,6 +993,12 @@ def init_browser():
             driver_instance = webdriver.Chrome(service=service, options=options)
         else:
             driver_instance = webdriver.Chrome(options=options)
+        driver_instance.set_page_load_timeout(30)
+        driver_instance.set_script_timeout(30)
+        try:
+            driver_instance.set_window_size(1280, 800)
+        except Exception:
+            pass
         driver_instance.get('https://www.google.com')
         driver = driver_instance
         last_stream_request = time.time()
@@ -780,22 +1149,10 @@ def capture_loop():
             if now - last_stream_request > IDLE_THRESHOLD_SECONDS:
                 time.sleep(IDLE_CAPTURE_DELAY)
                 continue
-            png = None
-            with lock:
-                if not driver:
-                    try:
-                        init_browser()
-                    except Exception as init_error:
-                        print(f"Capture init retry failed: {init_error}")
-                        time.sleep(2)
-                        continue
-                if driver:
-                    try:
-                        png = driver.get_screenshot_as_png()
-                    except WebDriverException as grab_error:
-                        restart_browser_locked(f"screenshot failure: {grab_error}")
-                        time.sleep(0.5)
-                        continue
+            png = safe_get_screenshot()
+            if png is None:
+                time.sleep(0.5)
+                continue
             if png:
                 image = Image.open(io.BytesIO(png))
                 frame_size = image.size
@@ -914,9 +1271,15 @@ Screen details:
 
 Allowed actions and required fields:
 - click → requires integer x, y, and reasoning.
-- type → requires text (include \\n for Enter when needed) and reasoning.
+- type → requires text (no implicit Enter; use press_enter) and reasoning.
 - wait → requires reasoning.
 - scroll → requires reasoning.
+- press_enter → requires reasoning.
+- open_url (or navigate) → requires url and reasoning.
+- paste → requires text (content to paste) and reasoning; omit text to use the paste shortcut.
+- copy → requires reasoning.
+- select_all → requires reasoning.
+- tab → requires reasoning.
 - done → requires reasoning only when task is achieved.
 - plan_step → REQUIRED integer referencing which plan item (1-based) you are executing right now.
 
@@ -924,18 +1287,20 @@ Critical rules:
 - Break the goal into the listed micro-steps and complete them sequentially.
 - If the instruction mentions Google search, always: open Google → click the search box → type the query → press Enter → click the top result.
 - Monitor the page for popups, dialogs, or unexpected screens and handle them before proceeding.
-- Before typing, ensure the correct input is focused (click first if needed). After typing a query that must be submitted, append \\n to press Enter.
+- Before typing, ensure the correct input is focused (click first if needed). Use a separate `press_enter` action instead of embedding \\n in the text when submitting.
+- Use `open_url` for explicit navigation instructions and `paste` for inserting clipboard-style text snippets.
 - If something looks wrong (different page, missing button), take corrective actions such as wait, scroll, or re-focus instead of repeating the same click.
 - Begin the reasoning text with "Step X/Y:" to identify the plan item you are executing and keep plan_step aligned with that number.
 
 STRICT OUTPUT FORMAT:
 Return exactly ONE JSON object following this schema:
 {{
-    "action": "click" | "type" | "wait" | "scroll" | "done",
+    "action": "click" | "type" | "wait" | "scroll" | "press_enter" | "open_url" | "navigate" | "paste" | "copy" | "select_all" | "tab" | "done",
     "reasoning": "short explanation",
     "x": <int> (only for click),
     "y": <int> (only for click),
-    "text": "..." (only for type),
+    "text": "..." (only for type or paste),
+    "url": "..." (only for open_url/navigate),
     "plan_step": <int>
 }}
 Do NOT write anything outside the JSON object. No Markdown, no lists, no explanations. Only the JSON object."""
@@ -1068,43 +1433,38 @@ def execute_ai_action(action: AIAction, task: AITask) -> bool:
 
             time.sleep(0.25)
 
-            with lock:
-                if not driver:
-                    init_browser()
-                if not driver:
-                    raise RuntimeError("Browser driver unavailable for click action")
-                last_stream_request = time.time()
-                metrics = driver.execute_cdp_cmd('Page.getLayoutMetrics', {})
-                layout = metrics.get('layoutViewport', {})
-                visual = metrics.get('visualViewport', {})
-                layout_width = visual.get('clientWidth') or layout.get('clientWidth', frame_size[0])
-                layout_height = visual.get('clientHeight') or layout.get('clientHeight', frame_size[1])
-                scale_x = layout_width / frame_size[0] if frame_size[0] else 1
-                scale_y = layout_height / frame_size[1] if frame_size[1] else 1
-                offset_x = visual.get('pageX', 0)
-                offset_y = visual.get('pageY', 0)
-                target_x = action.x * scale_x + offset_x
-                target_y = action.y * scale_y + offset_y
-                driver.execute_cdp_cmd('Input.dispatchMouseEvent', {
-                    'type': 'mouseMoved',
-                    'x': target_x,
-                    'y': target_y,
-                    'button': 'none'
-                })
-                driver.execute_cdp_cmd('Input.dispatchMouseEvent', {
-                    'type': 'mousePressed',
-                    'x': target_x,
-                    'y': target_y,
-                    'button': 'left',
-                    'clickCount': 1
-                })
-                driver.execute_cdp_cmd('Input.dispatchMouseEvent', {
-                    'type': 'mouseReleased',
-                    'x': target_x,
-                    'y': target_y,
-                    'button': 'left',
-                    'clickCount': 1
-                })
+            metrics = safe_execute_cdp('Page.getLayoutMetrics', {})
+            layout = metrics.get('layoutViewport', {}) if metrics else {}
+            visual = metrics.get('visualViewport', {}) if metrics else {}
+            layout_width = visual.get('clientWidth') or layout.get('clientWidth', frame_size[0])
+            layout_height = visual.get('clientHeight') or layout.get('clientHeight', frame_size[1])
+            scale_x = layout_width / frame_size[0] if frame_size[0] else 1
+            scale_y = layout_height / frame_size[1] if frame_size[1] else 1
+            offset_x = visual.get('pageX', 0)
+            offset_y = visual.get('pageY', 0)
+            target_x = action.x * scale_x + offset_x
+            target_y = action.y * scale_y + offset_y
+            safe_execute_cdp('Input.dispatchMouseEvent', {
+                'type': 'mouseMoved',
+                'x': target_x,
+                'y': target_y,
+                'button': 'none'
+            })
+            safe_execute_cdp('Input.dispatchMouseEvent', {
+                'type': 'mousePressed',
+                'x': target_x,
+                'y': target_y,
+                'button': 'left',
+                'clickCount': 1
+            })
+            safe_execute_cdp('Input.dispatchMouseEvent', {
+                'type': 'mouseReleased',
+                'x': target_x,
+                'y': target_y,
+                'button': 'left',
+                'clickCount': 1
+            })
+            last_stream_request = time.time()
 
             task.logs.append(f"✓ Clicked at ({action.x}, {action.y}): {action.reasoning}")
             time.sleep(0.4)
@@ -1114,36 +1474,68 @@ def execute_ai_action(action: AIAction, task: AITask) -> bool:
                 ai_last_cursor_position = end_pos
                 task.ai_cursor_pos = end_pos
 
-        elif action.action == "type" and action.text:
-            ensure_text_focus(task)
-            normalized_text = action.text.replace("\\n", "\n")
-            segments = normalized_text.split("\n")
-            google_handled = False
-            if instruction_mentions_google(task.instruction):
-                # Extract the actual search query from the instruction
-                actual_query = extract_search_query(task.instruction)
-                if actual_query:
-                    should_submit = len(segments) > 1 or normalized_text.endswith("\n")
-                    google_handled = perform_google_search_entry(actual_query, should_submit)
-                    if google_handled:
-                        submit_text = " and submitted" if should_submit else ""
-                        task.logs.append(f"🔎 Google search: typed '{actual_query}'{submit_text}")
+        elif action.action == "type":
+            handled = handle_text_input_action(task, action, allow_google_helper=True, log_prefix="⌨️ Typed")
+            if not handled:
+                task.logs.append(f"⚠️ Type action had no effect - {action.reasoning}")
 
-            if not google_handled:
-                try:
-                    type_text_via_cdp(segments)
-                except Exception as typing_error:
-                    task.logs.append(f"⚠️ Direct typing failed: {typing_error}. Restarting browser.")
-                    restart_browser_locked(f"typing failure: {typing_error}")
-                    raise
-
-            enter_count = max(0, len(segments) - 1)
-            typed_preview = normalized_text.replace("\n", "\\n")
-            if enter_count:
-                task.logs.append(f"✓ Typed: '{typed_preview}' + ENTER x{enter_count} - {action.reasoning}")
+        elif action.action == "paste":
+            if action.text:
+                handled = handle_text_input_action(task, action, allow_google_helper=True, log_prefix="📋 Pasted")
+                if not handled:
+                    task.logs.append(f"⚠️ Paste action had no effect - {action.reasoning}")
             else:
-                task.logs.append(f"✓ Typed: '{typed_preview}' - {action.reasoning}")
-            wait_for_dom_idle(task, "type")
+                modifier = get_primary_modifier_key()
+                success = send_keys_to_active((modifier, 'v'), chord=True)
+                if success:
+                    task.logs.append(f"📋 Triggered paste shortcut - {action.reasoning}")
+                    wait_for_dom_idle(task, "paste")
+                else:
+                    task.logs.append(f"⚠️ Paste skipped: no focused element - {action.reasoning}")
+                with ai_task_lock:
+                    if ai_cursor_position:
+                        ai_last_cursor_position = ai_cursor_position
+                    elif ai_last_cursor_position:
+                        ai_cursor_position = ai_last_cursor_position
+                    task.ai_cursor_pos = ai_cursor_position or ai_last_cursor_position
+
+        elif action.action == "press_enter":
+            success = False
+            if instruction_mentions_google(task.instruction):
+                ensure_text_focus(task)
+                success = submit_google_search()
+                if not success:
+                    success = send_keys_to_active(Keys.RETURN)
+                if success:
+                    task.logs.append(f"↩️ Pressed Enter to submit Google search - {action.reasoning}")
+                    wait_for_dom_idle(task, "press_enter")
+                    query = extract_search_query(task.instruction) or ""
+                    if query:
+                        if not wait_for_google_results(query):
+                            task.logs.append("⚠️ Google results not detected after Enter; retrying submission")
+                            perform_google_search_entry(query, True, clear=False)
+                            wait_for_dom_idle(task, "google retry")
+                            if not wait_for_google_results(query, timeout=6.0):
+                                task.google_retry_count += 1
+                                if not task.google_direct_used and task.google_retry_count >= 2:
+                                    task.logs.append("⚠️ Google results still missing; using direct navigation fallback")
+                                    if navigate_direct_google_search(task, query):
+                                        task.google_retry_count = 0
+                                else:
+                                    task.logs.append("⚠️ Google results still missing after retry")
+                        else:
+                            task.google_retry_count = 0
+                    else:
+                        task.google_retry_count = 0
+                else:
+                    task.logs.append(f"⚠️ Failed to press Enter for Google search - {action.reasoning}")
+            else:
+                success = send_keys_to_active(Keys.RETURN)
+                if success:
+                    task.logs.append(f"↩️ Pressed Enter - {action.reasoning}")
+                    wait_for_dom_idle(task, "press_enter")
+                else:
+                    task.logs.append(f"⚠️ Enter press skipped: no focused element - {action.reasoning}")
             with ai_task_lock:
                 if ai_cursor_position:
                     ai_last_cursor_position = ai_cursor_position
@@ -1151,14 +1543,48 @@ def execute_ai_action(action: AIAction, task: AITask) -> bool:
                     ai_cursor_position = ai_last_cursor_position
                 task.ai_cursor_pos = ai_cursor_position or ai_last_cursor_position
 
-        elif action.action == "navigate" and action.url:
-            with lock:
-                if not driver:
-                    init_browser()
-                if not driver:
-                    raise RuntimeError("Browser driver unavailable for navigation")
-                last_stream_request = time.time()
-                driver.get(action.url)
+        elif action.action == "copy":
+            modifier = get_primary_modifier_key()
+            if send_keys_to_active((modifier, 'c'), chord=True):
+                task.logs.append(f"📄 Copied selection - {action.reasoning}")
+            else:
+                task.logs.append(f"⚠️ Copy skipped: no focused element - {action.reasoning}")
+            with ai_task_lock:
+                if ai_cursor_position:
+                    ai_last_cursor_position = ai_cursor_position
+                elif ai_last_cursor_position:
+                    ai_cursor_position = ai_last_cursor_position
+                task.ai_cursor_pos = ai_cursor_position or ai_last_cursor_position
+
+        elif action.action == "select_all":
+            modifier = get_primary_modifier_key()
+            if send_keys_to_active((modifier, 'a'), chord=True):
+                task.logs.append(f"🖱️ Select-all triggered - {action.reasoning}")
+            else:
+                task.logs.append(f"⚠️ Select-all skipped: no focused element - {action.reasoning}")
+            with ai_task_lock:
+                if ai_cursor_position:
+                    ai_last_cursor_position = ai_cursor_position
+                elif ai_last_cursor_position:
+                    ai_cursor_position = ai_last_cursor_position
+                task.ai_cursor_pos = ai_cursor_position or ai_last_cursor_position
+
+        elif action.action == "tab":
+            if send_keys_to_active(Keys.TAB):
+                task.logs.append(f"⇥ Pressed Tab - {action.reasoning}")
+                wait_for_dom_idle(task, "tab")
+            else:
+                task.logs.append(f"⚠️ Tab key skipped: no focusable element - {action.reasoning}")
+            with ai_task_lock:
+                if ai_cursor_position:
+                    ai_last_cursor_position = ai_cursor_position
+                elif ai_last_cursor_position:
+                    ai_cursor_position = ai_last_cursor_position
+                task.ai_cursor_pos = ai_cursor_position or ai_last_cursor_position
+
+        elif action.action in ("navigate", "open_url") and action.url:
+            safe_get(action.url)
+            last_stream_request = time.time()
             task.logs.append(f"✓ Navigated to: {action.url}")
             wait_for_dom_idle(task, "navigate")
             with ai_task_lock:
@@ -1180,13 +1606,8 @@ def execute_ai_action(action: AIAction, task: AITask) -> bool:
                             delta = magnitude
                     except ValueError:
                         pass
-            with lock:
-                if not driver:
-                    init_browser()
-                if not driver:
-                    raise RuntimeError("Browser driver unavailable for scroll")
-                last_stream_request = time.time()
-                driver.execute_script("window.scrollBy(0, arguments[0])", delta)
+            safe_execute_script("window.scrollBy(0, arguments[0])", delta)
+            last_stream_request = time.time()
             direction = "up" if delta < 0 else "down"
             task.logs.append(f"✓ Scrolled {direction} ({delta}px) - {action.reasoning}")
             with ai_task_lock:
@@ -1241,10 +1662,45 @@ def ai_agent_loop(task_id: str):
                     print(f"Task {task_id} stopped by user")
                     break
                 task.current_step = step + 1
-            with lock:
-                if not driver:
-                    init_browser()
-                png = driver.get_screenshot_as_png()
+                queued_action = task.pending_actions.pop(0) if task.pending_actions else None
+
+            if queued_action:
+                if not queued_action.plan_step and task.plan_steps:
+                    with ai_task_lock:
+                        planned_len = len(task.plan_steps)
+                        queued_action.plan_step = min(task.plan_progress + 1, planned_len) if planned_len else 0
+                if not queued_action.reasoning:
+                    queued_action.reasoning = "Queued follow-up action"
+                task.logs.append(f"⚙️ Executing queued action: {queued_action.action}")
+                task.history.append({'step': step + 1, 'action': asdict(queued_action), 'timestamp': time.time(), 'queued': True})
+                print(f"Queued Action: {queued_action.action} - {queued_action.reasoning}")
+                should_continue = execute_ai_action(queued_action, task)
+                prior_progress = task.plan_progress
+                update_plan_progress(task, queued_action)
+                if task.plan_progress != prior_progress:
+                    verify_visual_progress(task)
+                if task.plan_steps and task.plan_progress >= len(task.plan_steps):
+                    task.logs.append("✅ All planned steps have been addressed")
+                if not should_continue:
+                    with ai_task_lock:
+                        task.status = TaskStatus.COMPLETED
+                        task.completed_at = time.time()
+                        ai_cursor_position = None
+                        ai_last_cursor_position = None
+                        task.ai_cursor_pos = None
+                    print(f"Task {task_id} completed successfully")
+                    break
+                last_action_signature = None
+                consecutive_click_count = 0
+                last_click_pos = None
+                duplicate_signature_count = 0
+                time.sleep(0.5)
+                continue
+
+            png = safe_get_screenshot()
+            if not png:
+                time.sleep(1)
+                continue
             plan_snapshot: List[str] = []
             plan_progress_snapshot = 0
             stalled_frames_snapshot = 0
@@ -1267,12 +1723,12 @@ def ai_agent_loop(task_id: str):
                 thinking_cursor = (width // 2, height // 2)
             if should_force_refresh:
                 screenshot.close()
-                with lock:
-                    try:
-                        driver.refresh()
-                    except Exception as refresh_error:
-                        with ai_task_lock:
-                            task.logs.append(f"⚠️ Refresh failed: {refresh_error}")
+                try:
+                    safe_refresh()
+                except Exception as refresh_error:
+                    with ai_task_lock:
+                        task.logs.append(f"⚠️ Refresh failed: {refresh_error}")
+                last_stream_request = time.time()
                 time.sleep(2)
                 continue
 
@@ -1348,7 +1804,7 @@ def ai_agent_loop(task_id: str):
                         print("🔄 Too many similar clicks, forcing type action")
                         # 検索クエリを抽出
                         search_query = extract_search_query(task.instruction) or "search"
-                        action = AIAction(action="type", text=f"{search_query}\\n", reasoning="Forced action to break click loop")
+                        action = build_forced_type_action(task, "forced loop break")
                         consecutive_click_count = 0
                         last_click_pos = None
                     else:
